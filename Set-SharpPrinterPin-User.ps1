@@ -1,4 +1,207 @@
-param([Parameter(Mandatory)][string]$ConfigPath)
+param(
+    [ValidateSet('Logon','User')][string]$Mode = 'Logon',
+    [string]$ConfigPath
+)
+
+if ($Mode -eq 'Logon') {
+    # ===================================================================
+    # LOGON MODE: runs as SYSTEM from the "at logon" scheduled task.
+    # Finds the logged-in user, looks up their PIN, and launches the
+    # user-mode part of this same file in their session if needed.
+    # ===================================================================
+    $ErrorActionPreference = 'Stop'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $Root    = Join-Path $env:ProgramData 'PrinterPinAuto'
+    $LogPath = Join-Path $Root 'log.txt'
+
+    $PrinterNames = @(
+        'Printer | ES Office 2025 - Sharp BP-70M31'
+        'Printer | HS Office 2025- Sharp BP-70C31'
+        'Printer | HS Staff - Sharp 2025 BP-70M31'
+        'Printer | MS Office 2025 - Sharp BP-70M31'
+        'Printer | MS Staff 2025 - Sharp BP-70C31'
+        'Printer | ES Staff 2025 - Sharp BP-70C31'
+    )
+
+    if (-not ('ConsoleSession' -as [type])) {
+        Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class ConsoleSession { [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId(); }'
+    }
+
+    function Write-Log([string]$Text) {
+        try {
+            Add-Content -LiteralPath $LogPath -Value ('{0:u} {1}' -f (Get-Date), $Text)
+            $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue)
+            if ($lines.Count -gt 400) { $lines[-200..-1] | Set-Content -LiteralPath $LogPath }
+        } catch {}
+    }
+
+    function Open-Hive64($Hive) {
+        [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, [Microsoft.Win32.RegistryView]::Registry64)
+    }
+
+    function Get-ActiveUserSid {
+        $console = [ConsoleSession]::WTSGetActiveConsoleSessionId()
+        if ($console -eq [uint32]::MaxValue) { return $null }
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$console")) {
+            $r = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid
+            if ($r.ReturnValue -eq 0 -and $r.Sid) { return [string]$r.Sid }
+        }
+        return $null
+    }
+
+    function Test-ScreenLocked {
+        $console = [ConsoleSession]::WTSGetActiveConsoleSessionId()
+        return [bool](Get-Process -Name LogonUI -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -eq $console })
+    }
+
+    function Get-GcpwEmail([string]$Sid) {
+        $k = (Open-Hive64 'LocalMachine').OpenSubKey("SOFTWARE\Google\GCPW\Users\$Sid")
+        if (-not $k) { return $null }
+        $email = $k.GetValue('email'); $k.Close(); return $email
+    }
+
+    # Throws on network errors; returns $null if the user is not in the roster.
+    function Get-UserPin([string]$Email) {
+        $body = @{ key = $LookupKey; email = $Email } | ConvertTo-Json -Compress
+        $r = Invoke-RestMethod -Uri $LookupUrl -Method Post -ContentType 'text/plain' -Body $body -UseBasicParsing -TimeoutSec 30
+        if ($r -is [string]) { $r = $r | ConvertFrom-Json }
+        if (-not $r.ok -or -not $r.pin -or -not $r.hex) { return $null }
+        return $r
+    }
+
+    function Test-PrinterPin([string]$Sid, [string]$Printer, [string]$ExpectedHex) {
+        try {
+            $k = (Open-Hive64 'Users').OpenSubKey("$Sid\Software\SHARP\$Printer\printer_ui\job_control")
+            if (-not $k) { return $false }
+            $use = $k.GetValue('use_account_number'); $acct = $k.GetValue('account_number'); $k.Close()
+            if ($null -eq $use -or [int]$use -ne 1) { return $false }
+            if ($acct -isnot [byte[]] -or $acct.Length -lt 16) { return $false }
+            return ((($acct[0..15]) | ForEach-Object { $_.ToString('X2') }) -join '') -eq $ExpectedHex
+        }
+        catch { return $false }
+    }
+
+    $JobDir  = $null
+    $JobTask = $null
+
+    try {
+        $cfg       = Get-Content -LiteralPath (Join-Path $Root 'config.json') -Raw | ConvertFrom-Json
+        $LookupUrl = [string]$cfg.LookupUrl
+        $LookupKey = [string]$cfg.LookupKey
+
+        # Wait for an unlocked desktop (up to 10 minutes)
+        $sid = $null
+        $deadline = (Get-Date).AddMinutes(10)
+        while ((Get-Date) -lt $deadline) {
+            $candidate = Get-ActiveUserSid
+            if ($candidate -and -not (Test-ScreenLocked)) { $sid = $candidate; break }
+            Start-Sleep -Seconds 10
+        }
+        if (-not $sid) { Write-Log 'No unlocked desktop within 10 minutes; exiting.'; exit 0 }
+
+        $installed = @(Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name)
+        $targets   = @($PrinterNames | Where-Object { $installed -contains $_ })
+        if ($targets.Count -eq 0) { Write-Log 'No target printers installed; exiting.'; exit 0 }
+
+        $email = Get-GcpwEmail $sid
+        if (-not $email) { Write-Log 'No GCPW email for the active user; exiting.'; exit 0 }
+
+        # Look up the PIN, retrying on network errors only
+        $user = $null
+        $lookupOk = $false
+        for ($i = 0; $i -lt 3 -and -not $lookupOk; $i++) {
+            try { $user = Get-UserPin $email; $lookupOk = $true }
+            catch { Start-Sleep -Seconds 30 }
+        }
+        if (-not $lookupOk) { Write-Log 'PIN lookup failed (network?); exiting.'; exit 0 }
+        if (-not $user)     { Write-Log 'User is not in the roster; exiting.'; exit 0 }
+
+        $toDo = @($targets | Where-Object { -not (Test-PrinterPin $sid $_ $user.hex) })
+        $attemptFile = Join-Path $Root "attempt_$sid.txt"
+
+        if ($toDo.Count -eq 0) {
+            Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue
+            Write-Log 'All installed printers already correct.'
+            exit 0
+        }
+
+        # Don't re-open the dialogs at every logon after a failed attempt
+        if (Test-Path -LiteralPath $attemptFile) {
+            $age = (Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $attemptFile).LastWriteTimeUtc
+            if ($age.TotalHours -lt 2) { Write-Log 'Recent failed attempt; skipping for now.'; exit 0 }
+        }
+
+        # Locked-down job folder: SYSTEM + this user only
+        $stamp   = [guid]::NewGuid().ToString('N')
+        $JobDir  = Join-Path $env:ProgramData ('PrinterPinJob_' + $stamp)
+        $JobTask = 'PrinterPinJob_' + $stamp
+        New-Item -ItemType Directory -Path $JobDir | Out-Null
+
+        $userSid = New-Object Security.Principal.SecurityIdentifier($sid)
+        $sysSid  = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+        $inherit = 'ContainerInherit,ObjectInherit'
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sysSid, 'FullControl', $inherit, 'None', 'Allow')))
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($userSid, 'Modify', $inherit, 'None', 'Allow')))
+        Set-Acl -Path $JobDir -AclObject $acl
+
+        $UserScript  = Join-Path $JobDir 'PrinterPin-User.ps1'
+        $JobConfig   = Join-Path $JobDir 'config.json'
+        $ResultsPath = Join-Path $JobDir 'results.json'
+
+        Copy-Item -LiteralPath $PSCommandPath -Destination $UserScript
+        @{ Pin = $user.pin; Hex = $user.hex; Printers = $toDo; ResultsPath = $ResultsPath } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath $JobConfig -Encoding UTF8
+
+        # Run the user-mode part as the logged-in user, in their session
+        $userName  = $userSid.Translate([Security.Principal.NTAccount]).Value
+        $psExe     = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $action    = New-ScheduledTaskAction -Execute $psExe -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$UserScript`" -Mode User -ConfigPath `"$JobConfig`"")
+        $principal = New-ScheduledTaskPrincipal -UserId $userName -LogonType Interactive -RunLevel Limited
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+
+        Register-ScheduledTask -TaskName $JobTask -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        Write-Log ('Starting user session job for {0} printer(s).' -f $toDo.Count)
+        Start-ScheduledTask -TaskName $JobTask
+
+        Start-Sleep -Seconds 5
+        $deadline = (Get-Date).AddMinutes(12)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Path -LiteralPath $ResultsPath) { break }
+            if ((Get-ScheduledTask -TaskName $JobTask).State -ne 'Running') { break }
+            Start-Sleep -Seconds 3
+        }
+        Start-Sleep -Seconds 2
+
+        $failed = 0
+        if (Test-Path -LiteralPath $ResultsPath) {
+            foreach ($r in @(Get-Content -LiteralPath $ResultsPath -Raw | ConvertFrom-Json)) {
+                Write-Log ('{0}: {1} - {2}' -f $r.Printer, $r.Status, $r.Details)
+                if ($r.Status -ne 'SUCCESS') { $failed++ }
+            }
+        }
+        else {
+            Write-Log ('No results file produced. Task last result: {0}' -f (Get-ScheduledTaskInfo -TaskName $JobTask).LastTaskResult)
+            $failed = 1
+        }
+
+        if ($failed -gt 0) { Set-Content -LiteralPath $attemptFile -Value (Get-Date).ToString('o') }
+        else               { Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue }
+    }
+    catch { Write-Log ('ERROR: ' + $_.Exception.Message) }
+    finally {
+        if ($JobTask) { Unregister-ScheduledTask -TaskName $JobTask -Confirm:$false -ErrorAction SilentlyContinue }
+        if ($JobDir)  { Remove-Item -LiteralPath $JobDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    exit 0
+}
+
+# ===================================================================
+# USER MODE: runs as the logged-in user (your original script)
+# ===================================================================
 
 $ErrorActionPreference = 'Stop'
 
