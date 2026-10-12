@@ -1,13 +1,14 @@
 param(
-    [ValidateSet('Logon','User')][string]$Mode = 'Logon',
+    [ValidateSet('Logon','User','Check')][string]$Mode = 'Logon',
     [string]$ConfigPath
 )
 
-if ($Mode -eq 'Logon') {
+if ($Mode -ne 'User') {
     # ===================================================================
-    # LOGON MODE: runs as SYSTEM from the "at logon" scheduled task.
-    # Finds the logged-in user, looks up their PIN, and launches the
-    # user-mode part of this same file in their session if needed.
+    # SHARED (Logon + Check), runs as SYSTEM.
+    # Check  = one-shot preflight; prints CLEAN / NEEDED / SKIP / UNKNOWN.
+    # Logon  = waits for an unlocked desktop, runs the preflight, then
+    #          launches the user-mode part in the user's session if needed.
     # ===================================================================
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -50,6 +51,15 @@ if ($Mode -eq 'Logon') {
         return $null
     }
 
+    # Identifies one sign-in session (the console session's earliest explorer start time)
+    function Get-SessionKey([string]$Sid) {
+        $console = [ConsoleSession]::WTSGetActiveConsoleSessionId()
+        $p = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $console } |
+               Sort-Object StartTime) | Select-Object -First 1
+        if ($p) { return ('{0}|{1}' -f $Sid, $p.StartTime.ToUniversalTime().Ticks) }
+        return $Sid
+    }
+
     function Test-ScreenLocked {
         $console = [ConsoleSession]::WTSGetActiveConsoleSessionId()
         return [bool](Get-Process -Name LogonUI -ErrorAction SilentlyContinue |
@@ -83,6 +93,49 @@ if ($Mode -eq 'Logon') {
         catch { return $false }
     }
 
+    function New-State($State, $Reason, $Sid = $null, $User = $null, $ToDo = @()) {
+        [pscustomobject]@{ State = $State; Reason = $Reason; Sid = $Sid; User = $User; ToDo = $ToDo }
+    }
+
+    # CLEAN = verified correct or nothing applicable | NEEDED | SKIP = can't act for this user | UNKNOWN = can't verify
+    function Get-DeploymentState([string]$Sid, [int]$Attempts = 3, [int]$RetrySeconds = 30) {
+        $installed = @(Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name)
+        $targets   = @($PrinterNames | Where-Object { $installed -contains $_ })
+        if ($targets.Count -eq 0) { return New-State 'CLEAN' 'No target printers installed.' }
+
+        if (-not $Sid) { $Sid = Get-ActiveUserSid }
+        if (-not $Sid) { return New-State 'UNKNOWN' 'No signed-in user.' }
+
+        $email = Get-GcpwEmail $Sid
+        if (-not $email) { return New-State 'SKIP' 'No GCPW email for the active user.' }
+
+        $user = $null
+        $lookupOk = $false
+        for ($i = 0; $i -lt $Attempts -and -not $lookupOk; $i++) {
+            try { $user = Get-UserPin $email; $lookupOk = $true }
+            catch { if ($i -lt $Attempts - 1) { Start-Sleep -Seconds $RetrySeconds } }
+        }
+        if (-not $lookupOk) { return New-State 'UNKNOWN' 'PIN lookup failed (network?).' }
+        if (-not $user)     { return New-State 'SKIP' 'User is not in the roster.' }
+
+        $toDo = @($targets | Where-Object { -not (Test-PrinterPin $Sid $_ $user.hex) })
+        if ($toDo.Count -eq 0) { return New-State 'CLEAN' 'All installed printers already correct.' $Sid $user }
+        return New-State 'NEEDED' ('{0} printer(s) need configuration.' -f $toDo.Count) $Sid $user $toDo
+    }
+
+    # ---------------- CHECK MODE (called by the Worker) ----------------
+    if ($Mode -eq 'Check') {
+        try {
+            $cfg       = Get-Content -LiteralPath (Join-Path $Root 'config.json') -Raw | ConvertFrom-Json
+            $LookupUrl = [string]$cfg.LookupUrl
+            $LookupKey = [string]$cfg.LookupKey
+            Write-Output (Get-DeploymentState -Attempts 2 -RetrySeconds 5).State
+        }
+        catch { Write-Output 'UNKNOWN' }
+        exit 0
+    }
+
+    # ---------------- LOGON MODE ----------------
     $JobDir  = $null
     $JobTask = $null
 
@@ -101,37 +154,23 @@ if ($Mode -eq 'Logon') {
         }
         if (-not $sid) { Write-Log 'No unlocked desktop within 10 minutes; exiting.'; exit 0 }
 
-        $installed = @(Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name)
-        $targets   = @($PrinterNames | Where-Object { $installed -contains $_ })
-        if ($targets.Count -eq 0) { Write-Log 'No target printers installed; exiting.'; exit 0 }
-
-        $email = Get-GcpwEmail $sid
-        if (-not $email) { Write-Log 'No GCPW email for the active user; exiting.'; exit 0 }
-
-        # Look up the PIN, retrying on network errors only
-        $user = $null
-        $lookupOk = $false
-        for ($i = 0; $i -lt 3 -and -not $lookupOk; $i++) {
-            try { $user = Get-UserPin $email; $lookupOk = $true }
-            catch { Start-Sleep -Seconds 30 }
-        }
-        if (-not $lookupOk) { Write-Log 'PIN lookup failed (network?); exiting.'; exit 0 }
-        if (-not $user)     { Write-Log 'User is not in the roster; exiting.'; exit 0 }
-
-        $toDo = @($targets | Where-Object { -not (Test-PrinterPin $sid $_ $user.hex) })
         $attemptFile = Join-Path $Root "attempt_$sid.txt"
 
-        if ($toDo.Count -eq 0) {
-            Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue
-            Write-Log 'All installed printers already correct.'
+        $state = Get-DeploymentState -Sid $sid
+        if ($state.State -ne 'NEEDED') {
+            if ($state.State -eq 'CLEAN') { Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue }
+            Write-Log ('{0} Exiting.' -f $state.Reason)
             exit 0
         }
+        $user  = $state.User
+        $toDo  = @($state.ToDo)
 
-        # Don't re-open the dialogs at every logon after a failed attempt
-        if (Test-Path -LiteralPath $attemptFile) {
-            $age = (Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $attemptFile).LastWriteTimeUtc
-            if ($age.TotalHours -lt 2) { Write-Log 'Recent failed attempt; skipping for now.'; exit 0 }
-        }
+        # Once per sign-in session until it succeeds. The marker is written BEFORE the
+        # attempt, so a crash or a "Run Later" also counts; it is cleared only on success.
+        $sessionKey = Get-SessionKey $sid
+        $previous   = ([string](Get-Content -LiteralPath $attemptFile -Raw -ErrorAction SilentlyContinue)).Trim()
+        if ($previous -eq $sessionKey) { Write-Log 'Already attempted in this sign-in session; will retry at next logon.'; exit 0 }
+        Set-Content -LiteralPath $attemptFile -Value $sessionKey
 
         # Locked-down job folder: SYSTEM + this user only
         $stamp   = [guid]::NewGuid().ToString('N')
@@ -176,11 +215,12 @@ if ($Mode -eq 'Logon') {
         }
         Start-Sleep -Seconds 2
 
-        $failed = 0
+        $failed = 0; $deferred = 0
         if (Test-Path -LiteralPath $ResultsPath) {
             foreach ($r in @(Get-Content -LiteralPath $ResultsPath -Raw | ConvertFrom-Json)) {
                 Write-Log ('{0}: {1} - {2}' -f $r.Printer, $r.Status, $r.Details)
-                if ($r.Status -ne 'SUCCESS') { $failed++ }
+                if     ($r.Status -eq 'DEFERRED') { $deferred++ }
+                elseif ($r.Status -ne 'SUCCESS')  { $failed++ }
             }
         }
         else {
@@ -188,8 +228,8 @@ if ($Mode -eq 'Logon') {
             $failed = 1
         }
 
-        if ($failed -gt 0) { Set-Content -LiteralPath $attemptFile -Value (Get-Date).ToString('o') }
-        else               { Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue }
+        # Clear the session marker only on full success; Panel does the final verification and cleanup
+        if ($failed -eq 0 -and $deferred -eq 0) { Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue }
     }
     catch { Write-Log ('ERROR: ' + $_.Exception.Message) }
     finally {
@@ -200,7 +240,7 @@ if ($Mode -eq 'Logon') {
 }
 
 # ===================================================================
-# USER MODE: runs as the logged-in user (your original script)
+# USER MODE: runs as the logged-in user
 # ===================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -274,7 +314,7 @@ public class SharpPrinterPinMouse {
 }
 
 # -------------------------
-# Progress window
+# Prompt / progress window
 # -------------------------
 
 $Form = New-Object System.Windows.Forms.Form
@@ -300,7 +340,7 @@ $Form.Controls.Add($WarningPanel)
 $WarningLabel = New-Object System.Windows.Forms.Label
 $WarningLabel.Location = New-Object System.Drawing.Point(10, 5)
 $WarningLabel.Size = New-Object System.Drawing.Size(545, 38)
-$WarningLabel.Text = 'PLEASE DO NOT USE YOUR KEYBOARD OR MOUSE WHILE THIS PROCESS IS RUNNING.'
+$WarningLabel.Text = 'ONCE THE PROCESS STARTS, PLEASE DO NOT USE YOUR KEYBOARD OR MOUSE UNTIL IT FINISHES.'
 $WarningLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $WarningLabel.ForeColor = [System.Drawing.Color]::Red
 $WarningLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
@@ -308,11 +348,11 @@ $WarningPanel.Controls.Add($WarningLabel)
 
 $InfoLabel = New-Object System.Windows.Forms.Label
 $InfoLabel.Location = New-Object System.Drawing.Point(22, 72)
-$InfoLabel.Size = New-Object System.Drawing.Size(560, 48)
+$InfoLabel.Size = New-Object System.Drawing.Size(560, 52)
 $InfoLabel.Text = @(
-    'This process should take about one minute',
-    'If it does not finish promptly, please contact your IT department',
-    'This script runs once automatically to apply your User Number to office and staff room printers'
+    'This process takes about one minute.',
+    'Choose Run Later if you are busy; you will be asked again at your next sign-in.',
+    'If it does not finish promptly, please contact your IT department.'
 ) -join "`r`n"
 $InfoLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $InfoLabel.ForeColor = [System.Drawing.Color]::FromArgb(65, 65, 65)
@@ -321,10 +361,27 @@ $Form.Controls.Add($InfoLabel)
 $StatusLabel = New-Object System.Windows.Forms.Label
 $StatusLabel.Location = New-Object System.Drawing.Point(22, 130)
 $StatusLabel.Size = New-Object System.Drawing.Size(560, 35)
-$StatusLabel.Text = 'Preparing printer configuration...'
+$StatusLabel.Text = 'Your printer settings need to be updated.'
 $StatusLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
 $StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(30, 45, 65)
 $Form.Controls.Add($StatusLabel)
+
+# Run Now / Run Later buttons (shown first, in the progress bar's spot)
+$script:Choice = $null
+
+$RunNowButton = New-Object System.Windows.Forms.Button
+$RunNowButton.Text = 'Run Now'
+$RunNowButton.Location = New-Object System.Drawing.Point(22, 170)
+$RunNowButton.Size = New-Object System.Drawing.Size(150, 36)
+$RunNowButton.Add_Click({ $script:Choice = 'Now' })
+$Form.Controls.Add($RunNowButton)
+
+$RunLaterButton = New-Object System.Windows.Forms.Button
+$RunLaterButton.Text = 'Run Later'
+$RunLaterButton.Location = New-Object System.Drawing.Point(182, 170)
+$RunLaterButton.Size = New-Object System.Drawing.Size(150, 36)
+$RunLaterButton.Add_Click({ $script:Choice = 'Later' })
+$Form.Controls.Add($RunLaterButton)
 
 $ProgressBar = New-Object System.Windows.Forms.ProgressBar
 $ProgressBar.Location = New-Object System.Drawing.Point(22, 173)
@@ -332,14 +389,16 @@ $ProgressBar.Size = New-Object System.Drawing.Size(560, 23)
 $ProgressBar.Minimum = 0
 $ProgressBar.Maximum = $PrinterNames.Count
 $ProgressBar.Style = 'Continuous'
+$ProgressBar.Visible = $false
 $Form.Controls.Add($ProgressBar)
 
 $ProgressDetailLabel = New-Object System.Windows.Forms.Label
 $ProgressDetailLabel.Location = New-Object System.Drawing.Point(22, 204)
 $ProgressDetailLabel.Size = New-Object System.Drawing.Size(560, 35)
-$ProgressDetailLabel.Text = 'Preparing to update printer settings...'
+$ProgressDetailLabel.Text = ''
 $ProgressDetailLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
 $ProgressDetailLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$ProgressDetailLabel.Visible = $false
 $Form.Controls.Add($ProgressDetailLabel)
 
 $Form.Show()
@@ -566,35 +625,48 @@ function Set-PrinterPin {
 # -------------------------
 
 try {
-    for ($Countdown = 5; $Countdown -ge 1; $Countdown--) {
-        Update-Progress -Message "Starting in $Countdown seconds..." -Step 0 -Detail 'Please leave this window open.'
-        Start-Sleep -Seconds 1
+    # Run Now / Run Later (no answer for 10 minutes counts as Run Later)
+    $PromptDeadline = [DateTime]::UtcNow.AddMinutes(10)
+    while (-not $script:Choice) {
+        if ([DateTime]::UtcNow -gt $PromptDeadline) { $script:Choice = 'Later'; break }
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
     }
 
-    Update-Progress -Message 'Starting printer configuration...' -Step 0 -Detail 'Only printers needing changes will be opened.'
-
-    for ($Index = 0; $Index -lt $PrinterNames.Count; $Index++) {
-        $PrinterName = $PrinterNames[$Index]
-        $Step = $Index + 1
-
-        Update-Progress -Message "Configuring printer $Step of $($PrinterNames.Count)..." -Step ($Step - 1) -Detail $PrinterName
-
-        $Result = Set-PrinterPin -PrinterName $PrinterName
-        $Results += $Result
-
-        Update-Progress -Message "$($Result.Status): printer $Step of $($PrinterNames.Count)" -Step $Step -Detail $PrinterName
-    }
-
-    $SuccessCount = @($Results | Where-Object Status -eq 'SUCCESS').Count
-    $FailedCount  = @($Results | Where-Object Status -eq 'FAILED').Count
-
-    if ($FailedCount -gt 0) {
-        Update-Progress -Message 'Printer setup completed with errors.' -Step $PrinterNames.Count `
-            -Detail "$SuccessCount successful, $FailedCount failed. Contact IT if assistance is needed."
+    if ($script:Choice -eq 'Later') {
+        $Results += [PSCustomObject]@{ Printer = '(all)'; Status = 'DEFERRED'; Details = 'User chose Run Later (or did not respond).' }
     }
     else {
-        Update-Progress -Message 'Printer setup complete.' -Step $PrinterNames.Count `
-            -Detail "$SuccessCount successful. You may now use your computer."
+        $RunNowButton.Visible = $false
+        $RunLaterButton.Visible = $false
+        $ProgressBar.Visible = $true
+        $ProgressDetailLabel.Visible = $true
+
+        Update-Progress -Message 'Starting printer configuration...' -Step 0 -Detail 'Please do not use your keyboard or mouse.'
+
+        for ($Index = 0; $Index -lt $PrinterNames.Count; $Index++) {
+            $PrinterName = $PrinterNames[$Index]
+            $Step = $Index + 1
+
+            Update-Progress -Message "Configuring printer $Step of $($PrinterNames.Count)..." -Step ($Step - 1) -Detail $PrinterName
+
+            $Result = Set-PrinterPin -PrinterName $PrinterName
+            $Results += $Result
+
+            Update-Progress -Message "$($Result.Status): printer $Step of $($PrinterNames.Count)" -Step $Step -Detail $PrinterName
+        }
+
+        $SuccessCount = @($Results | Where-Object Status -eq 'SUCCESS').Count
+        $FailedCount  = @($Results | Where-Object Status -eq 'FAILED').Count
+
+        if ($FailedCount -gt 0) {
+            Update-Progress -Message 'Printer setup completed with errors.' -Step $PrinterNames.Count `
+                -Detail "$SuccessCount successful, $FailedCount failed. Contact IT if assistance is needed."
+        }
+        else {
+            Update-Progress -Message 'Printer setup complete.' -Step $PrinterNames.Count `
+                -Detail "$SuccessCount successful. You may now use your computer."
+        }
     }
 }
 catch {
