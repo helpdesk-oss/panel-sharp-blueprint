@@ -14,7 +14,12 @@ if ($Mode -ne 'User') {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $Root    = Join-Path $env:ProgramData 'PrinterPinAuto'
-    $LogPath = Join-Path $Root 'log.txt'
+    $LogDir  = Join-Path $env:ProgramData 'PrinterPinAuto-Logs'
+    $LogPath = Join-Path $LogDir 'payload.log'
+    try {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+        Start-Transcript -Path (Join-Path $LogDir ('payload-{0}-transcript.log' -f $Mode.ToLower())) -Append -Force | Out-Null
+    } catch {}
 
     $PrinterNames = @(
         'Printer | ES Office 2025 - Sharp BP-70M31'
@@ -31,9 +36,9 @@ if ($Mode -ne 'User') {
 
     function Write-Log([string]$Text) {
         try {
-            Add-Content -LiteralPath $LogPath -Value ('{0:u} {1}' -f (Get-Date), $Text)
+            Add-Content -LiteralPath $LogPath -Value ('{0:u} [{1}] {2}' -f (Get-Date), $PID, $Text)
             $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue)
-            if ($lines.Count -gt 400) { $lines[-200..-1] | Set-Content -LiteralPath $LogPath }
+            if ($lines.Count -gt 3000) { $lines[-1500..-1] | Set-Content -LiteralPath $LogPath }
         } catch {}
     }
 
@@ -113,7 +118,10 @@ if ($Mode -ne 'User') {
         $lookupOk = $false
         for ($i = 0; $i -lt $Attempts -and -not $lookupOk; $i++) {
             try { $user = Get-UserPin $email; $lookupOk = $true }
-            catch { if ($i -lt $Attempts - 1) { Start-Sleep -Seconds $RetrySeconds } }
+            catch {
+                Write-Log ('PIN lookup attempt {0} failed: {1}' -f ($i + 1), $_.Exception.Message)
+                if ($i -lt $Attempts - 1) { Start-Sleep -Seconds $RetrySeconds }
+            }
         }
         if (-not $lookupOk) { return New-State 'UNKNOWN' 'PIN lookup failed (network?).' }
         if (-not $user)     { return New-State 'SKIP' 'User is not in the roster.' }
@@ -123,15 +131,23 @@ if ($Mode -ne 'User') {
         return New-State 'NEEDED' ('{0} printer(s) need configuration.' -f $toDo.Count) $Sid $user $toDo
     }
 
+    Write-Log ('=== Mode {0} started as {1} (session {2})' -f $Mode, [Environment]::UserName, [Diagnostics.Process]::GetCurrentProcess().SessionId)
+
     # ---------------- CHECK MODE (called by the Worker) ----------------
     if ($Mode -eq 'Check') {
         try {
             $cfg       = Get-Content -LiteralPath (Join-Path $Root 'config.json') -Raw | ConvertFrom-Json
             $LookupUrl = [string]$cfg.LookupUrl
             $LookupKey = [string]$cfg.LookupKey
-            Write-Output (Get-DeploymentState -Attempts 2 -RetrySeconds 5).State
+            $s = Get-DeploymentState -Attempts 2 -RetrySeconds 5
+            Write-Log ('Check result: {0} - {1}' -f $s.State, $s.Reason)
+            Write-Output $s.State
         }
-        catch { Write-Output 'UNKNOWN' }
+        catch {
+            Write-Log ('ERROR: ' + $_.Exception.Message); Write-Log $_.ScriptStackTrace
+            Write-Output 'UNKNOWN'
+        }
+        try { Stop-Transcript | Out-Null } catch {}
         exit 0
     }
 
@@ -153,6 +169,7 @@ if ($Mode -ne 'User') {
             Start-Sleep -Seconds 10
         }
         if (-not $sid) { Write-Log 'No unlocked desktop within 10 minutes; exiting.'; exit 0 }
+        Write-Log "Unlocked desktop found for $sid"
 
         $attemptFile = Join-Path $Root "attempt_$sid.txt"
 
@@ -164,6 +181,7 @@ if ($Mode -ne 'User') {
         }
         $user  = $state.User
         $toDo  = @($state.ToDo)
+        Write-Log ('Printers needing config: {0}' -f (($toDo) -join '; '))
 
         # Once per sign-in session until it succeeds. The marker is written BEFORE the
         # attempt, so a crash or a "Run Later" also counts; it is cleared only on success.
@@ -203,11 +221,12 @@ if ($Mode -ne 'User') {
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 
         Register-ScheduledTask -TaskName $JobTask -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-        Write-Log ('Starting user session job for {0} printer(s).' -f $toDo.Count)
+        Write-Log ('Starting user session job for {0} printer(s) as {1}.' -f $toDo.Count, $userName)
         Start-ScheduledTask -TaskName $JobTask
 
+        # Parent waits up to 15 minutes (the user prompt times out after 5, the job limit is 15)
         Start-Sleep -Seconds 5
-        $deadline = (Get-Date).AddMinutes(12)
+        $deadline = (Get-Date).AddMinutes(15)
         while ((Get-Date) -lt $deadline) {
             if (Test-Path -LiteralPath $ResultsPath) { break }
             if ((Get-ScheduledTask -TaskName $JobTask).State -ne 'Running') { break }
@@ -231,10 +250,19 @@ if ($Mode -ne 'User') {
         # Clear the session marker only on full success; Panel does the final verification and cleanup
         if ($failed -eq 0 -and $deferred -eq 0) { Remove-Item -LiteralPath $attemptFile -Force -ErrorAction SilentlyContinue }
     }
-    catch { Write-Log ('ERROR: ' + $_.Exception.Message) }
+    catch { Write-Log ('ERROR: ' + $_.Exception.Message); Write-Log $_.ScriptStackTrace }
     finally {
         if ($JobTask) { Unregister-ScheduledTask -TaskName $JobTask -Confirm:$false -ErrorAction SilentlyContinue }
-        if ($JobDir)  { Remove-Item -LiteralPath $JobDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($JobDir) {
+            # Copy the user-mode transcript into the main log before the job folder is deleted
+            $ut = Join-Path $JobDir 'user-transcript.log'
+            if (Test-Path -LiteralPath $ut) {
+                try { Add-Content -LiteralPath $LogPath -Value ("--- user-mode transcript ---`r`n" + (Get-Content -LiteralPath $ut -Raw)) } catch {}
+            }
+            Remove-Item -LiteralPath $JobDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log '=== Logon mode finished'
+        try { Stop-Transcript | Out-Null } catch {}
     }
     exit 0
 }
@@ -244,6 +272,7 @@ if ($Mode -ne 'User') {
 # ===================================================================
 
 $ErrorActionPreference = 'Stop'
+try { Start-Transcript -Path (Join-Path (Split-Path -Parent $ConfigPath) 'user-transcript.log') -Force | Out-Null } catch {}
 
 $Config       = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 $TestPin      = [string]$Config.Pin
@@ -625,8 +654,8 @@ function Set-PrinterPin {
 # -------------------------
 
 try {
-    # Run Now / Run Later (no answer for 10 minutes counts as Run Later)
-    $PromptDeadline = [DateTime]::UtcNow.AddMinutes(10)
+    # Run Now / Run Later (no answer for 5 minutes counts as Run Later)
+    $PromptDeadline = [DateTime]::UtcNow.AddMinutes(5)
     while (-not $script:Choice) {
         if ([DateTime]::UtcNow -gt $PromptDeadline) { $script:Choice = 'Later'; break }
         [System.Windows.Forms.Application]::DoEvents()
@@ -671,6 +700,7 @@ try {
 }
 catch {
     $Results += [PSCustomObject]@{ Printer = '(all)'; Status = 'FAILED'; Details = $_.Exception.Message }
+    Write-Host ("ERROR: {0}`r`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
 }
 finally {
     if ($Form -and -not $Form.IsDisposed) {
@@ -678,6 +708,8 @@ finally {
         $Form.Dispose()
     }
 }
+
+try { Stop-Transcript | Out-Null } catch {}
 
 ConvertTo-Json -InputObject @($Results | Select-Object Printer, Status, Details) |
     Set-Content -LiteralPath $ResultsPath -Encoding UTF8
